@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Parking AI</title>
+<style>
+  body{margin:0;background:#111;color:#eee;font:16px -apple-system,system-ui,sans-serif}
+  #wrap{position:relative}
+  video,#pic{width:100%;display:block;background:#000;min-height:40px}
+  #pic{display:none}
+  #ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+  .bar{padding:10px 16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  button,input[type=text],label.btn{font:inherit;padding:8px 12px;border-radius:8px;border:0}
+  button,label.btn{background:#2b6;color:#fff}
+  button:disabled{background:#555}
+  input[type=text]{flex:1;min-width:0}
+  #log{padding:0 16px 24px;font-size:13px;white-space:pre-wrap;color:#aaa}
+</style>
+</head>
+<body>
+<div id="wrap"><video id="v" playsinline muted autoplay></video><img id="pic" alt="zdjęcie testowe"><canvas id="ov"></canvas></div>
+<div class="bar">
+  <input id="topic" type="text" placeholder="temat ntfy, np. parking-k8f3x9q2m7" autocapitalize="off" autocorrect="off">
+  <button id="test">Test</button>
+</div>
+<div class="bar">
+  <button id="start" disabled>Ładuję AI…</button>
+  <label class="btn">📷 Test na zdjęciu<input id="file" type="file" accept="image/*" hidden></label>
+</div>
+<div id="log">AI rozpoznaje samochody samo, bez zaznaczania. Obraz nie opuszcza telefonu.
+Samochód, który stał co najmniej ~50 s i zniknął na ~30 s = powiadomienie.
+Niebieski = nowy, czerwony = stoi, pomarańczowy = zniknął (odliczanie).</div>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const EVERY = 8000;      // ms between detections; keeps the phone cool
+const PARKED = 6;        // detections in a row (~50 s) before a car counts as parked, so passing cars are ignored
+const GONE = 4;          // missed detections in a row (~30 s) before a parked car counts as gone
+const NEW_SCORE = .45, KEEP_SCORE = .2; // a weaker hit is enough to keep an already known car
+const VEHICLES = ['car', 'truck', 'bus'];
+const $ = id => document.getElementById(id);
+const v = $('v'), pic = $('pic'), ov = $('ov'), ctx = ov.getContext('2d');
+let model, src = v, tracks = [], timer;
+$('topic').value = localStorage.topic || '';
+$('topic').onchange = () => localStorage.topic = $('topic').value.trim();
+
+function log(m) { $('log').textContent = new Date().toLocaleTimeString() + ' ' + m + '\n' + $('log').textContent.slice(0, 3000); }
+function notify(msg) {
+  const t = $('topic').value.trim();
+  if (!t) return log('Brak tematu ntfy!');
+  fetch('https://ntfy.sh/' + encodeURIComponent(t), {method: 'POST', body: msg, headers: {Title: 'Parking', Priority: 'high', Tags: 'car'}})
+    .then(r => log(r.ok ? 'Wysłano: ' + msg : 'Błąd ntfy ' + r.status))
+    .catch(() => { log('Brak sieci, ponawiam za 30 s'); setTimeout(() => notify(msg), 30000); });
+}
+
+function inter(a, b) {
+  return Math.max(0, Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0])) * Math.max(0, Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]));
+}
+function iou(a, b) { const i = inter(a, b); return i / (a[2] * a[3] + b[2] * b[3] - i); }
+// the model shrinks input to 300 px, so a whole parking lot is too small: detect in 27 overlapping tiles
+// of two grid sizes (tested on the real view: 11/14 cars vs 0/14 on the full frame), then merge
+const tile = document.createElement('canvas');
+async function detectTiled(src) {
+  const W = src.videoWidth || src.naturalWidth, H = src.videoHeight || src.naturalHeight, all = [];
+  for (const [cols, rows, fw, fh] of [[3, 4, .45, .35], [3, 5, .4, .3]]) for (let i = 0; i < cols; i++) for (let j = 0; j < rows; j++) {
+    const tw = W * fw, th = H * fh, x = (W - tw) * i / (cols - 1), y = (H - th) * j / (rows - 1);
+    tile.width = tw; tile.height = th;
+    tile.getContext('2d').drawImage(src, x, y, tw, th, 0, 0, tw, th);
+    for (const d of await model.detect(tile, 30, KEEP_SCORE))
+      if (VEHICLES.includes(d.class)) all.push({score: d.score, bbox: [d.bbox[0] + x, d.bbox[1] + y, d.bbox[2], d.bbox[3]]});
+  }
+  // same car seen in two tiles (maybe cut in half by a tile edge): keep the more confident box
+  const kept = [];
+  for (const d of all.sort((a, b) => b.score - a.score)) {
+    const a = d.bbox[2] * d.bbox[3];
+    if (!kept.some(k => inter(k.bbox, d.bbox) > .5 * Math.min(a, k.bbox[2] * k.bbox[3]))) kept.push(d);
+  }
+  return kept;
+}
+// matches detections ({bbox, score}) to known cars; returns parked cars that just left
+function update(tracks, dets) {
+  const free = dets.slice();
+  for (const t of tracks) {
+    let best = -1, bi = .3;
+    free.forEach((d, i) => { const o = iou(t.box, d.bbox); if (o > bi && d.score >= KEEP_SCORE) { bi = o; best = i; } });
+    if (best >= 0) { t.box = free.splice(best, 1)[0].bbox; t.age++; t.miss = 0; } else t.miss++;
+  }
+  const left = tracks.filter(t => t.miss >= GONE && t.age >= PARKED);
+  const keep = tracks.filter(t => t.miss < GONE);
+  for (const d of free) if (d.score >= NEW_SCORE) keep.push({box: d.bbox, age: 1, miss: 0});
+  tracks.splice(0, tracks.length, ...keep);
+  return left;
+}
+
+async function detect() {
+  const dets = await detectTiled(src);
+  const parked = tracks.filter(t => t.age >= PARKED).length;
+  const left = update(tracks, dets);
+  // many cars "vanishing" at once = darkness, camera moved or blocked, not real departures
+  if (left.length > 1 && left.length > parked / 2) log(`Zniknęło ${left.length} aut naraz – pewnie ciemno albo telefon się ruszył, nie wysyłam`);
+  else for (const _ of left) notify('Samochód odjechał – miejsce się zwolniło!');
+  draw(dets);
+}
+
+function draw(dets) {
+  const r = ov.getBoundingClientRect(), dpr = devicePixelRatio, k = r.width / (src.videoWidth || src.naturalWidth);
+  ov.width = r.width * dpr; ov.height = r.height * dpr;
+  ctx.scale(dpr, dpr); ctx.lineWidth = 2; ctx.font = 'bold 13px sans-serif';
+  for (const d of dets) { ctx.strokeStyle = '#ff05'; ctx.strokeRect(...d.bbox.map(n => n * k)); }
+  for (const t of tracks) {
+    const [x, y, w, h] = t.box.map(n => n * k), col = t.miss ? '#fa0' : t.age >= PARKED ? '#f44' : '#4af';
+    ctx.strokeStyle = ctx.fillStyle = col; ctx.strokeRect(x, y, w, h);
+    ctx.fillText(t.miss ? `? ${t.miss}/${GONE}` : t.age >= PARKED ? 'stoi' : `${t.age}/${PARKED}`, x + 3, y + 14);
+  }
+}
+
+function run() { clearInterval(timer); tracks = []; detect(); timer = setInterval(detect, EVERY); }
+
+let lock = null;
+const keepAwake = () => navigator.wakeLock?.request('screen').then(l => lock = l).catch(() => {});
+document.addEventListener('visibilitychange', () => { if (!document.hidden && v.srcObject) { keepAwake(); v.play(); } });
+$('test').onclick = () => { localStorage.topic = $('topic').value.trim(); notify('Test – działa 👍'); };
+$('start').onclick = async () => {
+  try {
+    v.srcObject = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment', width: 1280}, audio: false});
+    await v.play(); keepAwake();
+    src = v; v.style.display = 'block'; pic.style.display = 'none';
+    run(); $('start').disabled = true; log('Kamera działa. Nie blokuj ekranu.');
+  } catch (e) { log('Kamera niedostępna: ' + e.message + ' (strona musi być przez https)'); }
+};
+function showPic(url) {
+  pic.onload = () => { src = pic; v.style.display = 'none'; pic.style.display = 'block'; detect().then(() => log(`Na zdjęciu znaleziono ${tracks.length} aut`)); };
+  pic.src = url;
+}
+$('file').onchange = e => e.target.files[0] && showPic(URL.createObjectURL(e.target.files[0]));
+window.onresize = () => draw([]);
+
+cocoSsd.load({base: 'mobilenet_v2'}).then(m => {
+  model = m; $('start').disabled = false; $('start').textContent = '▶ Start kamery'; log('AI gotowe');
+  const img = new URLSearchParams(location.search).get('img');
+  if (img) showPic(img);
+}).catch(e => { $('start').textContent = 'Błąd AI'; log('Nie udało się załadować AI: ' + e.message); });
+
+// self-check: parked car leaving alerts once; a car driving past never does
+(() => {
+  const t = [], car = {bbox: [0, 0, 10, 10], score: .9}, out = [];
+  for (let i = 0; i < PARKED; i++) out.push(...update(t, [car, {bbox: [50, 0, 10, 10], score: .9}].slice(0, i < 2 ? 2 : 1)));
+  for (let i = 0; i < GONE; i++) out.push(...update(t, []));
+  console.assert(out.length === 1 && t.length === 0, 'expected exactly one departure');
+})();
+</script>
+</body>
+</html>
